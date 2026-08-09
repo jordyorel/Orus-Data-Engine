@@ -1,0 +1,412 @@
+# Orus Data Engine
+## Memory Model Specification
+Version 1.0
+Status: Draft
+
+---
+
+# 1. Introduction
+
+Ce document définit le modèle mémoire officiel d'Orus Data Engine.
+
+Tous les composants du moteur doivent respecter les règles décrites ici.
+
+Le modèle mémoire constitue l'un des fondements du moteur.
+
+Son objectif est de garantir :
+
+- une consommation mémoire prévisible ;
+- une excellente localité mémoire ;
+- un minimum d'allocations ;
+- une absence de fuites mémoire ;
+- des performances stables, quelle que soit la taille des données.
+
+---
+
+# 2. Philosophie
+
+Le moteur repose sur une idée simple :
+
+> La mémoire est une ressource planifiée.
+
+La mémoire n'est jamais allouée au hasard.
+
+Chaque allocation possède :
+
+- un propriétaire ;
+- une durée de vie ;
+- un responsable ;
+- une stratégie de libération.
+
+Toute allocation dont la durée de vie est ambiguë est considérée comme une erreur de conception.
+
+---
+
+# 3. Les trois niveaux de mémoire
+
+Le moteur distingue trois catégories.
+
+```
+Run Lifetime
+│
+├── Pipeline
+├── Schema
+├── Rules
+├── Statistics
+└── Metadata
+
+↓
+
+Batch Lifetime
+
+↓
+
+Scratch Lifetime
+```
+
+Chaque objet appartient à exactement une catégorie.
+
+---
+
+# 4. Run Lifetime
+
+Le Run Allocator vit pendant toute l'exécution du pipeline.
+
+Il contient uniquement des objets persistants.
+
+Exemples :
+
+- Schema
+- RuleEngine
+- Pattern compilés
+- HyperLogLog
+- HashMap globaux
+- Match Index
+- Pipeline
+- Metrics
+- Reports
+
+Le Run Allocator n'est jamais réinitialisé pendant l'exécution.
+
+Il est détruit uniquement à la fin du pipeline.
+
+---
+
+# 5. Batch Lifetime
+
+Le Batch Arena contient les données d'un batch.
+
+Exemples :
+
+- Column
+- Bitmap
+- String buffers
+- Batch
+- Temporary transformed columns
+
+Le Batch Arena est réinitialisé à chaque nouveau batch.
+
+Aucun objet du Run Lifetime ne doit pointer vers cette mémoire.
+
+---
+
+# 6. Scratch Lifetime
+
+Le Scratch Allocator possède la durée de vie la plus courte.
+
+Il sert uniquement aux calculs temporaires.
+
+Exemples :
+
+- buffers Levenshtein
+- tableaux de tri
+- buffers de parsing
+- conversions temporaires
+
+Il est détruit immédiatement après l'opération.
+
+---
+
+# 7. Double Buffering
+
+Deux Batch Arena sont maintenus simultanément.
+
+```
+Arena A
+↓
+
+Input Batch
+
+Arena B
+↓
+
+Output Batch
+```
+
+Après chaque transformation :
+
+```
+Input
+↓
+
+Output
+
+↓
+
+Swap
+
+↓
+
+Reset ancienne Arena
+```
+
+Cette technique permet :
+
+- aucune copie inutile ;
+- aucune allocation répétitive ;
+- destruction instantanée de tout un batch.
+
+---
+
+# 8. Ownership
+
+Chaque objet possède exactement un propriétaire.
+
+```
+Run Allocator
+        │
+        ├── Pipeline
+        ├── Rules
+        ├── Reports
+
+Batch Arena
+        │
+        ├── Batch
+        ├── Columns
+        ├── Bitmaps
+        └── Buffers
+```
+
+Le propriétaire est responsable de la destruction.
+
+Aucun objet ne doit être libéré par un autre composant.
+
+---
+
+# 9. Le Batch ne possède rien
+
+Le Batch est uniquement une vue.
+
+```
+Arena
+ │
+ ├── Columns
+ ├── Buffers
+ └── Batch
+```
+
+Le Batch ne libère jamais la mémoire.
+
+Lorsque l'Arena disparaît :
+
+le Batch devient invalide.
+
+---
+
+# 10. Colonnes
+
+Les colonnes possèdent uniquement des buffers continus.
+
+Exemple :
+
+```
+i64
+
+[12][18][25][42][51]
+```
+
+String :
+
+```
+Offsets
+
+0
+4
+9
+13
+
+↓
+
+Data
+
+MTNAIRTELCGT
+```
+
+Aucun tableau de pointeurs vers des chaînes n'est autorisé.
+
+---
+
+# 11. Null Bitmap
+
+Toutes les colonnes utilisent un bitmap séparé.
+
+```
+Valeurs
+
+100
+200
+300
+400
+
+Bitmap
+
+0 1 0 0
+```
+
+Les valeurs restent compactes.
+
+La présence d'un NULL ne modifie jamais le buffer principal.
+
+---
+
+# 12. Allocation Strategy
+
+Le moteur applique les règles suivantes.
+
+✓ Allocation groupée.
+
+✓ Réutilisation maximale.
+
+✓ Buffers continus.
+
+✓ Pas d'allocation par cellule.
+
+✓ Pas d'allocations cachées.
+
+---
+
+# 13. Ce qui est interdit
+
+Interdictions absolues.
+
+✗ malloc par ligne
+
+✗ malloc par cellule
+
+✗ linked list
+
+✗ arbre pour les colonnes
+
+✗ String dupliquées inutilement
+
+✗ ownership ambigu
+
+✗ free dispersés
+
+✗ pointeurs persistants vers Batch Arena
+
+---
+
+# 14. Localité mémoire
+
+Les données doivent être organisées pour favoriser le cache CPU.
+
+Objectifs :
+
+- parcours séquentiels ;
+- prélecture efficace ;
+- faible nombre de cache miss.
+
+Le moteur privilégie toujours des buffers continus.
+
+---
+
+# 15. String Storage
+
+Les chaînes sont stockées une seule fois.
+
+```
+Offsets
+
+0
+5
+11
+20
+
+↓
+
+Data
+
+AppleHuaweiOrange
+```
+
+Les slices sont calculées à partir des offsets.
+
+---
+
+# 16. Memory Safety
+
+Le moteur s'appuie sur les garanties de Zig.
+
+Cependant les règles suivantes sont obligatoires.
+
+Aucun pointeur ne doit survivre à son Arena.
+
+Aucune fonction ne retourne une référence vers un Scratch Allocator.
+
+Aucun composant ne conserve un Batch après le prochain swap.
+
+---
+
+# 17. Performance
+
+Le modèle mémoire est conçu pour :
+
+- limiter les allocations ;
+- améliorer le cache CPU ;
+- réduire la fragmentation ;
+- accélérer les parcours séquentiels.
+
+Les performances proviennent principalement :
+
+- de la disposition mémoire ;
+- de la réduction des copies ;
+- de la réutilisation des buffers.
+
+---
+
+# 18. Evolution
+
+Le modèle mémoire doit permettre ultérieurement :
+
+- plusieurs pipelines simultanés ;
+- traitement parallèle ;
+- NUMA ;
+- mémoire mappée ;
+- exécution distribuée.
+
+Ces évolutions ne devront jamais modifier les principes fondamentaux.
+
+---
+
+# 19. Résumé
+
+Le modèle mémoire d'Orus repose sur quelques règles simples.
+
+✓ Allocation par durée de vie.
+
+✓ Double buffering.
+
+✓ Arena Allocator.
+
+✓ Buffers continus.
+
+✓ Ownership unique.
+
+✓ Batch immuable.
+
+✓ Pas d'allocation par cellule.
+
+✓ Pas de pointeurs persistants.
+
+Le respect de ces règles est obligatoire pour tous les composants du moteur.

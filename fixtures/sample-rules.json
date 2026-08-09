@@ -1,0 +1,27 @@
+[
+  {
+    "id": 1,
+    "column": "id",
+    "tag": "string_length",
+    "min_length": 5,
+    "max_length": 5
+  },
+  {
+    "id": 2,
+    "column": "score",
+    "tag": "required"
+  },
+  {
+    "id": 3,
+    "column": "score",
+    "tag": "range",
+    "min": "8",
+    "max": "9"
+  },
+  {
+    "id": 4,
+    "column": "name",
+    "tag": "enum_values",
+    "values": ["Ada", "Bob"]
+  }
+]

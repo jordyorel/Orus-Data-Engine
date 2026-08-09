@@ -1,0 +1,18 @@
+# Zig build cache and output
+.zig-cache/
+zig-out/
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Temporary files and audit outputs
+*.tmp
+*.audit.jsonl
+
+# Large benchmark dataset files (>100MB hard limit on GitHub)
+fixtures/311_Service_Requests_from_2020_to_Present_20260808.csv
+fixtures/customers-2000000.csv

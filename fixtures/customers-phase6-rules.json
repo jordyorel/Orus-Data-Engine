@@ -1,0 +1,13 @@
+[
+  {
+    "id": 1,
+    "column": "Customer Id",
+    "tag": "unique"
+  },
+  {
+    "id": 2,
+    "column": "Email",
+    "tag": "regex",
+    "regex": "^[[:alnum:]._%+-]+@[[:alnum:].-]+\\.[[:alpha:]]{2,}$"
+  }
+]

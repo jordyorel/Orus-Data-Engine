@@ -1,0 +1,38 @@
+[
+  {
+    "id": 1,
+    "column": "Index",
+    "tag": "range",
+    "min": "1",
+    "max": "2000000"
+  },
+  {
+    "id": 2,
+    "column": "Customer Id",
+    "tag": "string_length",
+    "min_length": 15,
+    "max_length": 15
+  },
+  {
+    "id": 3,
+    "column": "Email",
+    "tag": "required"
+  },
+  {
+    "id": 4,
+    "column": "Email",
+    "tag": "pattern",
+    "pattern": "email"
+  },
+  {
+    "id": 5,
+    "column": "Subscription Date",
+    "tag": "required"
+  },
+  {
+    "id": 6,
+    "column": "Website",
+    "tag": "pattern",
+    "pattern": "url"
+  }
+]

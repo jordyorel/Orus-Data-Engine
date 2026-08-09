@@ -1,0 +1,2911 @@
+# Fiche technique — Orus Data Engine
+
+## 0. Présentation
+
+**Nom du projet :** Orus Data Engine
+**Version cible initiale :** v1.0
+**Langage :** Zig 0.16
+**Type de composant :** moteur de données bas niveau, colonnaire, streaming et embarquable
+**Position dans l’écosystème Orus :** fondation technique des futures couches Ontology, Workflows, Analytics et IA
+
+**Règles de code normatives :** [`docs/CODE_RULES.md`](CODE_RULES.md)
+
+---
+
+## 1. Périmètre
+
+Orus Data Engine couvre exclusivement les fonctions suivantes :
+
+```text
+Connecteurs
+    ↓
+Ingestion
+    ↓
+Inférence de schéma
+    ↓
+Profiling
+    ↓
+Validation
+    ↓
+Cleaning
+    ↓
+Matching
+    ↓
+Sinks
+```
+
+Le moteur ne comprend pas :
+
+* l’Ontology ;
+* le Graph Engine ;
+* les règles métier de haut niveau ;
+* les workflows ;
+* l’intelligence artificielle ;
+* les dashboards ;
+* l’API HTTP ;
+* l’authentification ;
+* la gestion des utilisateurs ;
+* le contrôle d’accès ;
+* l’interface graphique.
+
+Ces couches consommeront Orus Data Engine, mais resteront indépendantes du moteur.
+
+---
+
+# 2. Objectifs
+
+Orus Data Engine doit permettre de :
+
+1. lire de grands volumes de données sans charger un dataset complet en mémoire ;
+2. convertir les données brutes en batches colonnaires typés ;
+3. analyser progressivement la qualité des données ;
+4. détecter les erreurs sans interrompre silencieusement le pipeline ;
+5. appliquer des transformations déterministes et auditables ;
+6. rapprocher des entités provenant de plusieurs datasets ;
+7. produire des sorties nettoyées ou enrichies ;
+8. garantir une consommation mémoire prévisible ;
+9. fonctionner comme une bibliothèque embarquable ou comme un moteur autonome ;
+10. fournir un socle suffisamment stable pour les futures couches Ontology et IA.
+
+---
+
+# 3. Principes non négociables
+
+## 3.1 Immutabilité logique
+
+Les données originales ne sont jamais modifiées en place.
+
+Chaque transformation :
+
+* reçoit un batch d’entrée immuable ;
+* produit un nouveau batch ;
+* conserve une trace de provenance ;
+* ne modifie jamais les colonnes du batch source.
+
+L’immutabilité concerne la représentation logique des données. La conservation permanente de la source est assurée par son identité, sa version et son stockage d’origine.
+
+---
+
+## 3.2 Streaming obligatoire
+
+Le moteur ne charge jamais un dataset complet en mémoire.
+
+Le traitement est réalisé :
+
+* source par source ;
+* batch par batch ;
+* colonne par colonne ;
+* avec un état global limité et maîtrisé.
+
+Les composants nécessitant un état important, tels que l’unicité exacte ou le matching global, doivent supporter une stratégie de débordement sur disque.
+
+---
+
+## 3.3 Format interne colonnaire
+
+Aucune structure orientée ligne ne doit exister dans le chemin chaud.
+
+Les données sont stockées sous forme de colonnes :
+
+```text
+Batch
+├── Column 0
+├── Column 1
+├── Column 2
+└── Column N
+```
+
+Les structures ligne par ligne sont autorisées uniquement pour :
+
+* les interfaces de debugging ;
+* les tests ;
+* les messages d’erreur ;
+* les accès ponctuels ;
+* les exports spécifiques.
+
+---
+
+## 3.4 Mémoire bornée
+
+Le moteur doit garantir :
+
+* aucune allocation générale par cellule dans la boucle chaude ;
+* aucune accumulation illimitée des violations ;
+* aucune accumulation illimitée des résultats de matching ;
+* aucune accumulation de tous les batches ;
+* aucune structure exacte non bornée sans stratégie de spill.
+
+Les allocations sont regroupées par batch ou par opération.
+
+---
+
+## 3.5 Modules indépendants
+
+Chaque étage du pipeline doit être :
+
+* testable isolément ;
+* remplaçable ;
+* chaînable ;
+* indépendant de l’API ou de l’interface graphique ;
+* utilisable dans un pipeline complet ou de façon autonome.
+
+---
+
+## 3.6 Traçabilité
+
+Chaque transformation doit être :
+
+* identifiable ;
+* versionnée ;
+* paramétrée ;
+* déterministe lorsque cela est possible ;
+* associée à un batch source ;
+* reconstruisible à partir de la source originale et de sa recette.
+
+---
+
+## 3.7 Compilation avant exécution
+
+Les éléments suivants doivent être préparés avant le traitement des batches :
+
+* résolution des noms de colonnes ;
+* compilation des règles ;
+* compilation des expressions régulières ;
+* validation des types attendus ;
+* construction du plan de transformations ;
+* initialisation des accumulateurs ;
+* initialisation des sinks.
+
+Le chemin chaud doit manipuler principalement des indices et des structures déjà compilées.
+
+---
+
+# 4. Architecture générale
+
+```text
+Source
+  ↓
+Raw Batch
+  ↓
+Ingest Reader
+  ↓
+Typed Batch
+  ├──────────────→ Profile Tap
+  ├──────────────→ Validation Tap
+  ↓
+Transform Operators
+  ↓
+Cleaned Batch
+  ↓
+Matching Operators
+  ↓
+Sink
+```
+
+Les modules de profiling et de validation sont des **taps** :
+
+* ils observent les batches ;
+* ils mettent à jour leur état ;
+* ils ne modifient pas les données.
+
+Les modules de cleaning sont des **operators** :
+
+* ils consomment un batch ;
+* ils produisent un nouveau batch.
+
+Les sinks consomment les batches finaux.
+
+---
+
+# 5. Structure du monorepo
+
+```text
+orus-data-engine/
+├── build.zig
+├── build.zig.zon
+│
+├── src/
+│   ├── core/
+│   │   ├── value.zig
+│   │   ├── decimal.zig
+│   │   ├── bitmap.zig
+│   │   ├── string_column.zig
+│   │   ├── column.zig
+│   │   ├── schema.zig
+│   │   ├── batch.zig
+│   │   ├── batch_metadata.zig
+│   │   ├── source_identity.zig
+│   │   ├── arena_pool.zig
+│   │   ├── reader.zig
+│   │   └── sink.zig
+│   │
+│   ├── execution/
+│   │   ├── context.zig
+│   │   ├── allocators.zig
+│   │   ├── error_context.zig
+│   │   ├── plan.zig
+│   │   └── metrics.zig
+│   │
+│   ├── connectors/
+│   │   ├── source.zig
+│   │   ├── csv_source.zig
+│   │   ├── jsonl_source.zig
+│   │   └── postgres_source.zig
+│   │
+│   ├── ingestion/
+│   │   ├── type_infer.zig
+│   │   ├── converter.zig
+│   │   └── ingest_reader.zig
+│   │
+│   ├── profiling/
+│   │   ├── accumulator.zig
+│   │   ├── column_profiler.zig
+│   │   ├── numeric_stats.zig
+│   │   ├── null_stats.zig
+│   │   ├── length_stats.zig
+│   │   ├── cardinality.zig
+│   │   ├── hyperloglog.zig
+│   │   ├── pattern_detect.zig
+│   │   ├── profile_reader.zig
+│   │   └── profile_report.zig
+│   │
+│   ├── validation/
+│   │   ├── rule.zig
+│   │   ├── compile.zig
+│   │   ├── evaluator.zig
+│   │   ├── rule_engine.zig
+│   │   ├── violation.zig
+│   │   ├── violation_sink.zig
+│   │   └── validation_summary.zig
+│   │
+│   ├── cleaning/
+│   │   ├── transform.zig
+│   │   ├── transform_registry.zig
+│   │   ├── string_ops.zig
+│   │   ├── normalize_date.zig
+│   │   ├── normalize_currency.zig
+│   │   ├── provenance.zig
+│   │   ├── audit_log.zig
+│   │   └── replay.zig
+│   │
+│   ├── matching/
+│   │   ├── normalization.zig
+│   │   ├── exact_match.zig
+│   │   ├── blocking.zig
+│   │   ├── index.zig
+│   │   ├── levenshtein.zig
+│   │   ├── jaro_winkler.zig
+│   │   ├── scorer.zig
+│   │   ├── matcher.zig
+│   │   ├── match_result.zig
+│   │   └── match_sink.zig
+│   │
+│   ├── sinks/
+│   │   ├── csv_sink.zig
+│   │   ├── jsonl_sink.zig
+│   │   ├── null_sink.zig
+│   │   └── memory_sink.zig
+│   │
+│   └── pipeline/
+│       ├── builder.zig
+│       ├── pipeline.zig
+│       ├── executor.zig
+│       └── result.zig
+│
+├── tests/
+│   └── miroir de src/
+│
+├── fixtures/
+│   ├── csv/
+│   ├── jsonl/
+│   └── matching/
+│
+└── benchmarks/
+    ├── csv_parse.zig
+    ├── profiling.zig
+    ├── cleaning.zig
+    └── matching.zig
+```
+
+---
+
+# 6. Gestion de la mémoire
+
+## 6.1 Catégories d’allocateurs
+
+Le moteur distingue trois durées de vie.
+
+### Run allocator
+
+Durée de vie : exécution complète du pipeline.
+
+Il contient :
+
+* le schéma ;
+* les règles compilées ;
+* les accumulateurs ;
+* les index ;
+* les dictionnaires ;
+* les métadonnées ;
+* le plan d’exécution ;
+* les statistiques globales.
+
+### Batch arena pool
+
+Durée de vie : un ou plusieurs batches en cours.
+
+Il contient :
+
+* les colonnes ;
+* les buffers de chaînes ;
+* les bitmaps ;
+* les résultats temporaires ;
+* les batches transformés.
+
+### Scratch allocator
+
+Durée de vie : une opération courte.
+
+Il contient :
+
+* les buffers de Levenshtein ;
+* les tableaux temporaires ;
+* les espaces de tri ;
+* les buffers de parsing ;
+* les structures réutilisables.
+
+```zig
+const PipelineAllocators = struct {
+    run: std.mem.Allocator,
+    batches: BatchArenaPool,
+    scratch: ScratchArena,
+};
+```
+
+---
+
+## 6.2 Double buffering
+
+Deux arenas minimum sont nécessaires pour conserver simultanément :
+
+* le batch d’entrée ;
+* le batch de sortie.
+
+```zig
+const BatchArenaPool = struct {
+    arenas: [2]BatchArena,
+    input_index: u1 = 0,
+
+    fn input(self: *BatchArenaPool) *BatchArena {
+        return &self.arenas[self.input_index];
+    }
+
+    fn output(self: *BatchArenaPool) *BatchArena {
+        return &self.arenas[self.input_index ^ 1];
+    }
+
+    fn swap(self: *BatchArenaPool) void {
+        self.input_index ^= 1;
+        self.output().reset();
+    }
+};
+```
+
+Exécution :
+
+```text
+Source       → Arena A
+Trim         → Arena B
+Uppercase    → Arena A
+Replace      → Arena B
+Sink         ← Arena B
+```
+
+L’arena de sortie est réinitialisé avant chaque nouvelle utilisation.
+
+---
+
+## 6.3 Règle d’allocation dans le chemin chaud
+
+L’objectif n’est pas l’absence absolue d’allocation, mais :
+
+> aucune allocation générale imprévisible et aucune allocation individuelle par cellule dans la boucle chaude.
+
+Pour une transformation de chaînes :
+
+1. calculer la taille totale de sortie ;
+2. réserver un seul buffer ;
+3. écrire les résultats ;
+4. produire les offsets.
+
+---
+
+# 7. Types fondamentaux
+
+## 7.1 `value.zig`
+
+```zig
+pub const ValueTag = enum(u8) {
+    i64,
+    f64,
+    decimal,
+    boolean,
+    string,
+    date,
+    datetime,
+};
+```
+
+Le type `null` n’est pas intégré aux données. La nullité est stockée dans un bitmap séparé.
+
+```zig
+pub const Value = union(ValueTag) {
+    i64: i64,
+    f64: f64,
+    decimal: Decimal128,
+    boolean: bool,
+    string: []const u8,
+    date: i32,
+    datetime: i64,
+};
+```
+
+`Value` est réservé :
+
+* aux tests ;
+* au debugging ;
+* aux accès ponctuels ;
+* aux interfaces non critiques.
+
+Les opérateurs colonnaires accèdent directement aux buffers typés.
+
+---
+
+## 7.2 `decimal.zig`
+
+Les montants financiers ne doivent pas utiliser `f64` comme représentation canonique.
+
+```zig
+pub const Decimal128 = struct {
+    coefficient: i128,
+    scale: u8,
+};
+```
+
+Exemple :
+
+```text
+10,25 USD
+coefficient = 1025
+scale       = 2
+```
+
+Fonctions minimales :
+
+```zig
+fn parse(raw: []const u8, options: ParseOptions) !Decimal128
+fn compare(a: Decimal128, b: Decimal128) std.math.Order
+fn rescale(value: Decimal128, target_scale: u8) !Decimal128
+fn toString(value: Decimal128, allocator: std.mem.Allocator) ![]u8
+```
+
+---
+
+## 7.3 `bitmap.zig`
+
+```zig
+pub const NullBitmap = struct {
+    words: []u64,
+    len: usize,
+
+    fn isNull(self: *const NullBitmap, index: usize) bool
+    fn setNull(self: *NullBitmap, index: usize) void
+    fn clearNull(self: *NullBitmap, index: usize) void
+    fn countNulls(self: *const NullBitmap) usize
+};
+```
+
+Le comptage doit utiliser `@popCount` par mot de 64 bits.
+
+Un bitmap similaire peut être utilisé pour les booléens.
+
+---
+
+## 7.4 `string_column.zig`
+
+Les colonnes texte utilisent un buffer contigu et des offsets.
+
+```zig
+pub const StringColumn = struct {
+    offsets: []u32,
+    data: []const u8,
+
+    fn get(self: *const StringColumn, row: usize) []const u8
+};
+```
+
+Exemple :
+
+```text
+data    = "MTNAIRTELCONGO"
+offsets = [0, 3, 9, 14]
+```
+
+Cette représentation évite un pointeur et une longueur par cellule.
+
+---
+
+## 7.5 `column.zig`
+
+```zig
+pub const ColumnData = union(ValueTag) {
+    i64: []const i64,
+    f64: []const f64,
+    decimal: []const Decimal128,
+    boolean: BitVector,
+    string: StringColumn,
+    date: []const i32,
+    datetime: []const i64,
+};
+
+pub const Column = struct {
+    tag: ValueTag,
+    len: usize,
+    nulls: NullBitmap,
+    data: ColumnData,
+
+    fn isNull(self: *const Column, row: usize) bool
+    fn get(self: *const Column, row: usize) Value
+};
+```
+
+---
+
+## 7.6 `ColumnBuilder`
+
+Le builder expose des méthodes spécialisées.
+
+```zig
+pub const ColumnBuilder = struct {
+    tag: ValueTag,
+    arena: std.mem.Allocator,
+
+    fn appendNull(self: *ColumnBuilder) !void
+    fn appendI64(self: *ColumnBuilder, value: i64) !void
+    fn appendF64(self: *ColumnBuilder, value: f64) !void
+    fn appendDecimal(self: *ColumnBuilder, value: Decimal128) !void
+    fn appendBoolean(self: *ColumnBuilder, value: bool) !void
+    fn appendString(self: *ColumnBuilder, value: []const u8) !void
+    fn appendDate(self: *ColumnBuilder, value: i32) !void
+    fn appendDateTime(self: *ColumnBuilder, value: i64) !void
+    fn finish(self: *ColumnBuilder) !Column
+};
+```
+
+`append(Value)` peut exister comme API de confort, mais ne doit pas être utilisé dans les boucles critiques.
+
+---
+
+## 7.7 `schema.zig`
+
+```zig
+pub const Field = struct {
+    name: []const u8,
+    tag: ValueTag,
+    nullable: bool,
+    metadata: FieldMetadata = .{},
+};
+
+pub const Schema = struct {
+    fields: []const Field,
+    hash: u64,
+
+    fn indexOf(self: *const Schema, name: []const u8) ?usize
+    fn equals(self: *const Schema, other: *const Schema) bool
+    fn computeHash(self: *const Schema) u64
+};
+```
+
+---
+
+## 7.8 Identité des sources
+
+```zig
+pub const SourceIdentity = struct {
+    id: u128,
+    version: u64,
+    content_hash: [32]u8,
+    uri: []const u8,
+};
+```
+
+Le moteur ne suppose pas que la source reste chargée en mémoire.
+
+---
+
+## 7.9 Métadonnées de batch
+
+```zig
+pub const BatchMetadata = struct {
+    source_id: u128,
+    source_version: u64,
+    batch_id: u64,
+    global_row_offset: u64,
+};
+```
+
+---
+
+## 7.10 `batch.zig`
+
+```zig
+pub const Batch = struct {
+    schema: *const Schema,
+    columns: []const Column,
+    row_count: usize,
+    metadata: BatchMetadata,
+
+    fn column(self: *const Batch, index: usize) *const Column
+    fn columnByName(self: *const Batch, name: []const u8) ?*const Column
+};
+```
+
+Un batch ne possède pas directement la mémoire de ses colonnes. Celle-ci appartient à l’arena ayant servi à sa construction.
+
+---
+
+# 8. Contrats de flux
+
+## 8.1 `reader.zig`
+
+Interface pull-based commune aux readers.
+
+```zig
+pub const Reader = struct {
+    ptr: *anyopaque,
+
+    nextFn: *const fn (
+        ptr: *anyopaque,
+        output: *BatchArena,
+    ) anyerror!?Batch,
+
+    pub fn next(
+        self: Reader,
+        output: *BatchArena,
+    ) !?Batch {
+        return self.nextFn(self.ptr, output);
+    }
+};
+```
+
+`null` signifie fin de flux.
+
+Chaque wrapper contient son upstream dans son propre état.
+
+---
+
+## 8.2 `sink.zig`
+
+```zig
+pub const Sink = struct {
+    ptr: *anyopaque,
+
+    writeFn: *const fn (
+        ptr: *anyopaque,
+        batch: *const Batch,
+    ) anyerror!void,
+
+    finishFn: *const fn (
+        ptr: *anyopaque,
+    ) anyerror!void,
+
+    abortFn: *const fn (
+        ptr: *anyopaque,
+    ) void,
+
+    pub fn write(self: Sink, batch: *const Batch) !void
+    pub fn finish(self: Sink) !void
+    pub fn abort(self: Sink) void
+};
+```
+
+Un sink doit être finalisé en cas de succès et abandonné en cas d’erreur.
+
+---
+
+# 9. Connecteurs
+
+## 9.1 Contrat `Source`
+
+```zig
+pub const SourceCapabilities = packed struct {
+    replayable: bool = false,
+    seekable: bool = false,
+    bounded: bool = true,
+    schema_known: bool = false,
+};
+
+pub const Source = struct {
+    ptr: *anyopaque,
+
+    nextRawFn: *const fn (
+        ptr: *anyopaque,
+        output: *BatchArena,
+    ) anyerror!?Batch,
+
+    schemaFn: *const fn (
+        ptr: *anyopaque,
+    ) ?*const Schema,
+
+    identityFn: *const fn (
+        ptr: *anyopaque,
+    ) SourceIdentity,
+
+    capabilitiesFn: *const fn (
+        ptr: *anyopaque,
+    ) SourceCapabilities,
+};
+```
+
+---
+
+## 9.2 CSV Source
+
+```zig
+pub const CsvOptions = struct {
+    delimiter: u8 = ',',
+    quote_char: u8 = '"',
+    has_header: bool = true,
+    batch_size: usize = 8192,
+    error_policy: CsvErrorPolicy = .{},
+};
+```
+
+```zig
+pub const CsvErrorPolicy = struct {
+    malformed_row: MalformedRowPolicy = .fail,
+    extra_columns: ExtraColumnPolicy = .fail,
+    missing_columns: MissingColumnPolicy = .pad_null,
+    invalid_utf8: InvalidUtf8Policy = .fail,
+};
+```
+
+```zig
+pub const CsvSource = struct {
+    file: std.Io.File,
+    reader: std.Io.Reader,
+    identity: SourceIdentity,
+    raw_schema: ?Schema,
+    options: CsvOptions,
+    header_parsed: bool,
+    next_batch_id: u64,
+    global_row_offset: u64,
+
+    fn open(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        options: CsvOptions,
+    ) !CsvSource
+
+    fn parseHeader(self: *CsvSource) !Schema
+
+    fn nextRaw(
+        self: *CsvSource,
+        output: *BatchArena,
+    ) !?Batch
+
+    fn close(self: *CsvSource) void
+};
+```
+
+Le parser CSV doit supporter :
+
+* les champs entre guillemets ;
+* les délimiteurs dans les champs ;
+* les guillemets échappés ;
+* les fins de ligne Unix et Windows ;
+* les champs vides ;
+* les lignes multilignes entre guillemets ;
+* les erreurs structurelles configurables.
+
+---
+
+## 9.3 JSON Lines Source
+
+La v1 supporte uniquement JSON Lines :
+
+```json
+{"customer":"MTN","amount":1000}
+{"customer":"Airtel","amount":2500}
+```
+
+Un objet JSON correspond à une ligne logique.
+
+Le JSON array monolithique n’est pas prioritaire pour la v1.
+
+---
+
+## 9.4 PostgreSQL Source
+
+Prévu pour la v1.1.
+
+Contraintes :
+
+* utilisation d’un curseur serveur ;
+* récupération par lots ;
+* aucun chargement complet du résultat ;
+* schéma connu à partir des métadonnées PostgreSQL ;
+* contrôle de la taille des fetches ;
+* gestion explicite de la transaction et du curseur.
+
+---
+
+# 10. Ingestion et inférence de schéma
+
+## 10.1 Types bruts
+
+Les connecteurs texte peuvent initialement produire des colonnes de chaînes.
+
+L’IngestReader est responsable de :
+
+* l’échantillonnage ;
+* l’inférence ;
+* la conversion ;
+* la détection des valeurs invalides ;
+* la stabilisation du schéma.
+
+---
+
+## 10.2 Résultat d’inférence
+
+```zig
+pub const TypeCandidate = struct {
+    tag: ValueTag,
+    score: f32,
+    success_count: u64,
+    failure_count: u64,
+};
+
+pub const TypeInferenceResult = struct {
+    selected: ValueTag,
+    confidence: f32,
+    nullable: bool,
+    candidates: []const TypeCandidate,
+    observed_patterns: PatternFlags,
+};
+```
+
+---
+
+## 10.3 Options d’inférence
+
+```zig
+pub const TypeInferenceOptions = struct {
+    sample_rows: usize = 4096,
+    // Lossless default: any incompatible sampled value keeps the column textual.
+    minimum_confidence: f32 = 1.0,
+    prefer_string_on_ambiguity: bool = true,
+    preserve_leading_zeroes: bool = true,
+    date_order: DateOrder = .dmy,
+    trim_before_parse: bool = true,
+};
+```
+
+Règle par défaut :
+
+> En cas d’ambiguïté, conserver la donnée comme chaîne.
+
+Exemple :
+
+```text
+"001234"
+```
+
+doit rester une chaîne si sa nature numérique n’est pas certaine.
+
+---
+
+## 10.4 Stratégie pour les sources non rejouables
+
+L’inférence ne doit pas supposer qu’une source peut être relue.
+
+Stratégie v1 :
+
+1. lire le premier batch brut ;
+2. conserver ce batch dans l’arena d’entrée ;
+3. inférer le schéma ;
+4. convertir ce même batch ;
+5. figer le schéma ;
+6. traiter les batches suivants.
+
+Le premier batch brut reste vivant jusqu’à sa conversion.
+
+---
+
+## 10.5 `IngestReader`
+
+```zig
+pub const IngestReader = struct {
+    upstream: Source,
+    options: TypeInferenceOptions,
+    inferred_schema: ?Schema,
+    initialized: bool,
+
+    fn init(
+        source: Source,
+        options: TypeInferenceOptions,
+    ) IngestReader
+
+    fn next(
+        self: *IngestReader,
+        output: *BatchArena,
+    ) !?Batch
+
+    fn asReader(self: *IngestReader) Reader
+};
+```
+
+---
+
+# 11. Profiling
+
+## 11.1 Fonctionnement
+
+Le profiling est incrémental.
+
+Pour chaque batch :
+
+```text
+Batch
+  ↓
+Chaque colonne
+  ↓
+Accumulateurs
+  ↓
+État global mis à jour
+```
+
+Aucun second passage n’est requis pour les statistiques principales.
+
+---
+
+## 11.2 Accumulateur
+
+```zig
+pub const Accumulator = struct {
+    ptr: *anyopaque,
+
+    updateFn: *const fn (
+        ptr: *anyopaque,
+        column: *const Column,
+    ) void,
+
+    finalizeFn: *const fn (
+        ptr: *anyopaque,
+    ) AccumulatorResult,
+};
+```
+
+Les accumulateurs vivent dans le run allocator.
+
+---
+
+## 11.3 Statistiques numériques
+
+```zig
+pub const NumericStats = struct {
+    count: u64 = 0,
+    min: f64 = std.math.inf(f64),
+    max: f64 = -std.math.inf(f64),
+    mean: f64 = 0,
+    m2: f64 = 0,
+
+    fn updateValue(self: *NumericStats, value: f64) void
+
+    fn variance(self: *const NumericStats) ?f64
+
+    fn standardDeviation(self: *const NumericStats) ?f64
+};
+```
+
+L’algorithme de Welford est utilisé pour la moyenne et la variance.
+
+Les décimaux financiers disposent de statistiques séparées afin d’éviter une conversion systématique vers `f64`.
+
+---
+
+## 11.4 Null statistics
+
+```zig
+pub const NullStats = struct {
+    null_count: u64 = 0,
+    total_count: u64 = 0,
+
+    fn update(self: *NullStats, column: *const Column) void
+
+    fn nullRate(self: *const NullStats) f64
+};
+```
+
+---
+
+## 11.5 Longueur des chaînes
+
+```zig
+pub const LengthStats = struct {
+    count: u64 = 0,
+    min: usize = std.math.maxInt(usize),
+    max: usize = 0,
+    mean: f64 = 0,
+};
+```
+
+---
+
+## 11.6 Cardinalité adaptative
+
+```zig
+pub const CARDINALITY_SWITCH_THRESHOLD: usize = 10_000;
+
+pub const CardinalityMode = enum {
+    exact,
+    approximate,
+};
+```
+
+```zig
+pub const AdaptiveCardinality = struct {
+    mode: CardinalityMode,
+    exact_set: std.AutoHashMap(u64, void),
+    hll: HyperLogLog,
+    hash_version: HashVersion,
+
+    fn update(self: *AdaptiveCardinality, column: *const Column) !void
+
+    fn distinctCount(self: *const AdaptiveCardinality) usize
+};
+```
+
+Lorsque la cardinalité dépasse le seuil :
+
+1. les hashes exacts sont injectés dans HyperLogLog ;
+2. le HashMap est libéré ;
+3. le mode passe en approximatif.
+
+---
+
+## 11.7 HyperLogLog
+
+```zig
+pub const HyperLogLog = struct {
+    registers: [16384]u8,
+
+    fn insert(self: *HyperLogLog, hash: u64) void
+
+    fn estimate(self: *const HyperLogLog) usize
+};
+```
+
+La fonction de hash doit être :
+
+* stable ;
+* versionnée ;
+* indépendante des conteneurs internes de Zig.
+
+```zig
+pub const HashVersion = enum(u8) {
+    xxh3_v1 = 1,
+};
+```
+
+---
+
+## 11.8 Détection de patterns
+
+```zig
+pub const PatternTag = enum {
+    email,
+    phone_e164,
+    date_iso,
+    date_dmy,
+    currency_amount,
+    uuid,
+    url,
+    unknown,
+};
+```
+
+La détection est réalisée sur un échantillon borné, pas sur toute la colonne.
+
+```zig
+fn detectPattern(
+    samples: []const []const u8,
+    options: PatternOptions,
+) ?PatternTag
+```
+
+---
+
+## 11.9 ProfileReader
+
+```zig
+pub const ProfileReader = struct {
+    upstream: Reader,
+    profilers: []ColumnProfiler,
+    row_count: u64,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        upstream: Reader,
+        schema: *const Schema,
+    ) !ProfileReader
+
+    fn next(
+        self: *ProfileReader,
+        output: *BatchArena,
+    ) !?Batch
+
+    fn finalize(
+        self: *ProfileReader,
+        allocator: std.mem.Allocator,
+    ) !ProfileReport
+
+    fn asReader(self: *ProfileReader) Reader
+};
+```
+
+Le batch est transmis inchangé.
+
+---
+
+## 11.10 Rapport de profiling
+
+```zig
+pub const ColumnProfile = struct {
+    name: []const u8,
+    tag: ValueTag,
+    nullable: bool,
+    null_rate: f64,
+    distinct_count: usize,
+    cardinality_mode: CardinalityMode,
+    numeric: ?NumericProfile,
+    length: ?LengthStats,
+    detected_pattern: ?PatternTag,
+};
+```
+
+```zig
+pub const ProfileReport = struct {
+    columns: []const ColumnProfile,
+    rows_processed: u64,
+    batches_processed: u64,
+    source_id: u128,
+    schema_hash: u64,
+
+    fn toJson(
+        self: *const ProfileReport,
+        allocator: std.mem.Allocator,
+    ) ![]u8
+};
+```
+
+---
+
+# 12. Validation
+
+## 12.1 Règles supportées
+
+```zig
+pub const RuleTag = enum {
+    required,
+    unique,
+    regex,
+    enum_values,
+    range,
+    type_check,
+    string_length,
+    custom,
+};
+```
+
+---
+
+## 12.2 Définition d’une règle
+
+```zig
+pub const Rule = struct {
+    id: u32,
+    column: []const u8,
+    tag: RuleTag,
+    payload: RulePayload,
+    message_template: []const u8,
+};
+```
+
+---
+
+## 12.3 Compilation des règles
+
+Avant l’exécution :
+
+```text
+Nom de colonne
+    ↓
+Index de colonne
+
+Regex texte
+    ↓
+Regex compilée
+
+Range générique
+    ↓
+Évaluateur typé
+```
+
+```zig
+pub const CompiledRule = struct {
+    id: u32,
+    column_index: u32,
+    tag: RuleTag,
+    evaluator: RuleEvaluator,
+    message_template: []const u8,
+};
+```
+
+---
+
+## 12.4 Identité d’une ligne
+
+```zig
+pub const RowId = struct {
+    source_id: u128,
+    batch_id: u64,
+    row_in_batch: u32,
+    global_offset: u64,
+};
+```
+
+---
+
+## 12.5 Violation compacte
+
+```zig
+pub const ViolationCode = enum(u16) {
+    required_missing,
+    duplicate_value,
+    regex_mismatch,
+    enum_mismatch,
+    below_minimum,
+    above_maximum,
+    invalid_type,
+    invalid_length,
+    custom_failed,
+};
+```
+
+```zig
+pub const Violation = struct {
+    row_id: RowId,
+    column_index: u32,
+    rule_id: u32,
+    code: ViolationCode,
+};
+```
+
+Les messages humains sont générés lors de l’export, pas stockés à répétition pour chaque violation.
+
+---
+
+## 12.6 ViolationSink
+
+Les violations ne sont pas accumulées sans limite en mémoire.
+
+```zig
+pub const ViolationSink = struct {
+    ptr: *anyopaque,
+
+    writeFn: *const fn (
+        ptr: *anyopaque,
+        violations: []const Violation,
+    ) anyerror!void,
+
+    finishFn: *const fn (
+        ptr: *anyopaque,
+    ) anyerror!void,
+};
+```
+
+Implémentations :
+
+* `JsonLinesViolationSink` ;
+* `CsvViolationSink` ;
+* `CountingViolationSink` ;
+* `SamplingViolationSink` ;
+* `MemoryViolationSink` pour les tests.
+
+---
+
+## 12.7 Validation d’unicité
+
+L’unicité exacte peut nécessiter un état important.
+
+```zig
+pub const UniqueMode = enum {
+    exact_memory,
+    exact_spill,
+    approximate_candidates,
+};
+```
+
+### `exact_memory`
+
+Pour les datasets de taille limitée.
+
+### `exact_spill`
+
+Les valeurs basculent dans un B-tree SQLite temporaire avec la valeur canonique
+complète comme clé primaire. Cette décision remplace le partitionnement manuel
+initialement prévu : elle conserve l'égalité exacte, borne l'état en mémoire,
+évite qu'une collision de hash soit déclarée comme doublon et délègue la durée
+de vie du fichier temporaire à une bibliothèque éprouvée. Le cache SQLite est
+explicitement borné et aucune durabilité n'est demandée pour cet état jetable.
+
+### `approximate_candidates`
+
+Un Bloom filter détecte les candidats potentiels. Une seconde vérification exacte reste obligatoire avant de déclarer un doublon.
+
+---
+
+## 12.8 RuleEngine
+
+```zig
+pub const RuleEngine = struct {
+    upstream: Reader,
+    rules: []const CompiledRule,
+    sink: ViolationSink,
+    summary: ValidationSummary,
+
+    fn next(
+        self: *RuleEngine,
+        output: *BatchArena,
+    ) !?Batch
+
+    fn finalize(self: *RuleEngine) !ValidationSummary
+
+    fn asReader(self: *RuleEngine) Reader
+};
+```
+
+Les violations de validation ne sont jamais des erreurs Zig.
+
+Le batch continue en aval.
+
+---
+
+## 12.9 Résumé de validation
+
+```zig
+pub const ValidationSummary = struct {
+    total_violations: u64,
+    violations_by_rule: []const RuleCount,
+    violations_by_column: []const ColumnCount,
+    rows_with_violations: u64,
+    output_truncated: bool,
+};
+```
+
+---
+
+# 13. Cleaning
+
+## 13.1 Contrat Transform
+
+```zig
+pub const Transform = struct {
+    ptr: *anyopaque,
+    id: u128,
+    name: []const u8,
+    version: u32,
+
+    applyFn: *const fn (
+        ptr: *anyopaque,
+        input: *const Batch,
+        output: *BatchArena,
+        scratch: std.mem.Allocator,
+    ) anyerror!Batch,
+
+    serializeParamsFn: *const fn (
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) anyerror![]u8,
+};
+```
+
+Une transformation est immuable après compilation.
+
+---
+
+## 13.2 Transformations texte
+
+Premières opérations :
+
+* trim ;
+* trim left ;
+* trim right ;
+* uppercase ;
+* lowercase ;
+* replace exact ;
+* suppression de caractères ;
+* normalisation des espaces ;
+* suppression des accents en option ;
+* normalisation Unicode configurable.
+
+Les transformations doivent opérer colonne par colonne.
+
+---
+
+## 13.3 Normalisation des dates
+
+```zig
+pub const DateNormalizer = struct {
+    column_index: u32,
+    accepted_formats: []const DateFormat,
+    target_type: DateTargetType,
+    invalid_policy: InvalidValuePolicy,
+};
+```
+
+La sortie canonique est :
+
+* `i32` pour une date ;
+* `i64` pour un datetime.
+
+Le format d’affichage n’est pas stocké dans la valeur interne.
+
+---
+
+## 13.4 Normalisation des devises
+
+```zig
+pub const CurrencyNormalizer = struct {
+    amount_column_index: u32,
+    currency_column_index: u32,
+    target_currency: []const u8,
+    rate_provider: ExchangeRateProvider,
+    rounding: RoundingMode,
+};
+```
+
+Les taux sont injectés.
+
+Ils ne sont jamais hardcodés dans le moteur.
+
+Chaque taux doit avoir :
+
+* une devise source ;
+* une devise cible ;
+* une valeur ;
+* une date d’effet ;
+* une source ;
+* une version.
+
+---
+
+## 13.5 Provenance
+
+Une transformation de 8192 lignes produit une entrée de provenance par batch, sauf mode debug.
+
+```zig
+pub const ProvenanceEntry = struct {
+    pipeline_run_id: u128,
+
+    source_id: u128,
+    source_version: u64,
+
+    batch_id: u64,
+    global_row_range: [2]u64,
+
+    transform_id: u128,
+    transform_name: []const u8,
+    transform_version: u32,
+
+    params: []const u8,
+    params_hash: u64,
+
+    input_schema_hash: u64,
+    output_schema_hash: u64,
+
+    timestamp_ms: i64,
+};
+```
+
+Le hash garantit l’intégrité, mais ne remplace pas les paramètres sérialisés.
+
+---
+
+## 13.6 AuditLog
+
+```zig
+pub const AuditLog = struct {
+    file: std.Io.File,
+    writer: std.Io.Writer.Allocating,
+    entries_written: u64,
+    bytes_written: u64,
+
+    fn open(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) !AuditLog
+
+    fn record(
+        self: *AuditLog,
+        entry: *const ProvenanceEntry,
+    ) !void
+
+    fn finish(self: *AuditLog) !AuditSummary
+
+    fn abort(self: *AuditLog) void
+};
+```
+
+Le journal est append-only.
+
+Il est écrit progressivement sur disque.
+
+---
+
+## 13.7 Reconstruction
+
+La reconstruction est séparée du journal.
+
+```text
+AuditLog
+    → fournit la recette
+
+TransformRegistry
+    → fournit l’implémentation versionnée
+
+SourceStore
+    → relit la donnée originale
+
+ReplayEngine
+    → rejoue la transformation
+```
+
+```zig
+pub const ReplayEngine = struct {
+    source_store: SourceStore,
+    registry: TransformRegistry,
+
+    fn reconstruct(
+        self: *ReplayEngine,
+        entry: *const ProvenanceEntry,
+        row: u64,
+        allocator: std.mem.Allocator,
+    ) !ReconstructedChange
+};
+```
+
+---
+
+## 13.8 Mode debug
+
+Le mode debug peut capturer un échantillon avant/après.
+
+Il est :
+
+* désactivé par défaut ;
+* borné par un nombre maximal de lignes ;
+* interdit comme comportement implicite en production.
+
+---
+
+# 14. Matching
+
+## 14.1 Principe
+
+Le matching doit fonctionner entre datasets complets, pas uniquement entre deux batches présents simultanément en mémoire.
+
+Pipeline général :
+
+```text
+Dataset de référence
+    ↓
+Normalisation
+    ↓
+Blocking keys
+    ↓
+Index persistant ou partitionné
+
+Dataset candidat
+    ↓
+Normalisation
+    ↓
+Recherche de candidats
+    ↓
+Scoring
+    ↓
+MatchSink
+```
+
+---
+
+## 14.2 Normalisation
+
+Les normalisations possibles comprennent :
+
+* trim ;
+* lowercase ;
+* suppression des accents ;
+* suppression de ponctuation ;
+* normalisation des espaces ;
+* normalisation des numéros de téléphone ;
+* normalisation des références ;
+* tokenisation des noms.
+
+Chaque stratégie est versionnée.
+
+---
+
+## 14.3 Matching exact
+
+Le matching exact compare des clés normalisées.
+
+```zig
+pub const ExactMatchKey = struct {
+    hash: u64,
+    normalized_value: []const u8,
+};
+```
+
+Les collisions de hash doivent être vérifiées avec la valeur canonique lorsque le mode exact l’exige.
+
+---
+
+## 14.4 Blocking
+
+Le blocking évite la comparaison `O(n × m)`.
+
+Exemples :
+
+```text
+Nom : MTN Congo
+Blocking key : MTN
+
+Téléphone : +242 06 123 45 67
+Blocking key : 06123
+
+Facture : INV-2026-001
+Blocking key : INV2026
+```
+
+```zig
+pub const BlockingStrategy = union(enum) {
+    prefix: usize,
+    token_prefix: usize,
+    phonetic,
+    exact_normalized,
+    custom: CustomBlockingFn,
+};
+```
+
+---
+
+## 14.5 Index de matching
+
+```zig
+pub const MatchIndex = struct {
+    backend: MatchIndexBackend,
+
+    fn insertBatch(
+        self: *MatchIndex,
+        batch: *const Batch,
+    ) !void
+
+    fn finalize(self: *MatchIndex) !void
+
+    fn candidates(
+        self: *MatchIndex,
+        key: BlockingKey,
+        output: *CandidateBuffer,
+    ) ![]const Candidate
+};
+```
+
+Backends possibles :
+
+* mémoire ;
+* partitions sur disque ;
+* fichier trié ;
+* index embarqué.
+
+La v1 peut commencer par mémoire avec limites strictes, puis introduire le spill.
+
+---
+
+## 14.6 Levenshtein borné
+
+```zig
+fn boundedLevenshtein(
+    a: []const u8,
+    b: []const u8,
+    max_distance: usize,
+    scratch: []usize,
+) ?usize
+```
+
+Optimisations obligatoires :
+
+* rejet selon la différence de longueur ;
+* arrêt anticipé ;
+* buffers réutilisables ;
+* aucune allocation par comparaison ;
+* utilisation uniquement sur des candidats déjà bloqués.
+
+---
+
+## 14.7 Jaro-Winkler
+
+```zig
+fn jaroWinklerSimilarity(
+    a: []const u8,
+    b: []const u8,
+) f32
+```
+
+Approprié principalement pour :
+
+* noms de personnes ;
+* noms d’entreprises ;
+* libellés courts.
+
+Il ne doit pas être appliqué automatiquement à toutes les colonnes texte.
+
+---
+
+## 14.8 Score de matching
+
+```zig
+pub const MatchMethod = enum {
+    exact,
+    levenshtein,
+    jaro_winkler,
+    composite,
+};
+```
+
+```zig
+pub const MatchResult = struct {
+    left: RowId,
+    right: RowId,
+    score: f32,
+    method: MatchMethod,
+    scorer_version: u32,
+};
+```
+
+---
+
+## 14.9 MatchSink
+
+Les résultats ne sont pas conservés intégralement en RAM.
+
+```zig
+pub const MatchSink = struct {
+    ptr: *anyopaque,
+
+    writeFn: *const fn (
+        ptr: *anyopaque,
+        results: []const MatchResult,
+    ) anyerror!void,
+
+    finishFn: *const fn (
+        ptr: *anyopaque,
+    ) anyerror!void,
+};
+```
+
+Implémentations :
+
+* JSON Lines ;
+* CSV ;
+* fichier binaire ;
+* comptage seulement ;
+* mémoire pour les tests.
+
+---
+
+## 14.10 Matcher
+
+```zig
+pub const Matcher = struct {
+    index: MatchIndex,
+    scorer: MatchScorer,
+    sink: MatchSink,
+    threshold: f32,
+    summary: MatchSummary,
+
+    fn consume(
+        self: *Matcher,
+        batch: *const Batch,
+        scratch: std.mem.Allocator,
+    ) !void
+
+    fn finalize(self: *Matcher) !MatchSummary
+};
+```
+
+---
+
+# 15. Sinks de données
+
+## 15.1 CSV Sink
+
+Fonctions :
+
+* écriture batch par batch ;
+* header optionnel ;
+* échappement conforme ;
+* sérialisation des nulls configurable ;
+* écriture transactionnelle via fichier temporaire ;
+* renommage final uniquement après succès.
+
+---
+
+## 15.2 JSON Lines Sink
+
+Un objet par ligne.
+
+Le format doit préserver :
+
+* les types numériques ;
+* les nulls ;
+* les dates ;
+* les décimaux ;
+* l’ordre des colonnes.
+
+---
+
+## 15.3 Null Sink
+
+Utilisé pour :
+
+* benchmarks ;
+* profiling seul ;
+* tests de débit ;
+* validation sans export.
+
+---
+
+## 15.4 Memory Sink
+
+Réservé aux tests et petits jeux de données.
+
+Une limite maximale doit être obligatoire.
+
+---
+
+# 16. Orchestration
+
+## 16.1 Pipeline Builder
+
+```zig
+pub const PipelineBuilder = struct {
+    source: Source,
+    profiling_options: ?ProfilingOptions = null,
+    validation_rules: ?[]const Rule = null,
+    transforms: std.ArrayList(Transform),
+    matcher: ?MatcherConfig = null,
+    sink: ?Sink = null,
+    violation_sink: ?ViolationSink = null,
+    audit_config: ?AuditConfig = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        source: Source,
+    ) PipelineBuilder
+
+    fn withProfiling(
+        self: *PipelineBuilder,
+        options: ProfilingOptions,
+    ) *PipelineBuilder
+
+    fn withValidation(
+        self: *PipelineBuilder,
+        rules: []const Rule,
+        sink: ViolationSink,
+    ) *PipelineBuilder
+
+    fn withTransform(
+        self: *PipelineBuilder,
+        transform: Transform,
+    ) !*PipelineBuilder
+
+    fn withMatching(
+        self: *PipelineBuilder,
+        config: MatcherConfig,
+    ) *PipelineBuilder
+
+    fn withSink(
+        self: *PipelineBuilder,
+        sink: Sink,
+    ) *PipelineBuilder
+
+    fn build(
+        self: *PipelineBuilder,
+        context: *ExecutionContext,
+    ) !Pipeline
+};
+```
+
+---
+
+## 16.2 Plan d’exécution
+
+Avant le premier batch, le builder produit un plan.
+
+```zig
+pub const ExecutionPlan = struct {
+    source_schema: *const Schema,
+    output_schema: *const Schema,
+    readers: []const ReaderStage,
+    transforms: []const Transform,
+    sink: Sink,
+    estimated_memory: usize,
+    requires_spill: bool,
+};
+```
+
+Le plan valide :
+
+* la compatibilité des schémas ;
+* les colonnes ciblées ;
+* les types ;
+* les règles ;
+* les transforms ;
+* les capacités de la source ;
+* la présence du sink ;
+* les besoins de spill.
+
+Pour une source texte dont le schéma typé est inféré, le plan structurel est
+compilé avant lecture, puis les hashes `source_schema_hash` et
+`output_schema_hash` sont résolus au premier batch. Les règles et transforms
+sont validés contre ce schéma avant de traiter leurs cellules ; le plan ne
+fabrique pas un schéma hypothétique au moment du build.
+
+---
+
+## 16.3 ExecutionContext
+
+```zig
+pub const ExecutionContext = struct {
+    allocators: PipelineAllocators,
+    error_context: ErrorContext,
+    metrics: ExecutionMetrics,
+    run_id: u128,
+    temp_dir: []const u8,
+};
+```
+
+---
+
+## 16.4 Exécution
+
+```zig
+pub const Pipeline = struct {
+    plan: ExecutionPlan,
+
+    fn run(
+        self: *Pipeline,
+        context: *ExecutionContext,
+    ) !PipelineResult
+};
+```
+
+Pseudo-code :
+
+```zig
+while (try final_reader.next(context.allocators.batches.input())) |batch| {
+    try sink.write(&batch);
+
+    context.metrics.rows_written += batch.row_count;
+    context.metrics.batches_processed += 1;
+
+    context.allocators.batches.swap();
+}
+
+try sink.finish();
+```
+
+En cas d’erreur :
+
+```zig
+sink.abort();
+audit_log.abort();
+return err;
+```
+
+---
+
+# 17. Résultat du pipeline
+
+```zig
+pub const AuditSummary = struct {
+    path: []const u8,
+    entries_written: u64,
+    bytes_written: u64,
+    checksum: [32]u8,
+};
+```
+
+```zig
+pub const PipelineResult = struct {
+    profile: ?ProfileReport,
+    validation: ?ValidationSummary,
+    matching: ?MatchSummary,
+    audit: ?AuditSummary,
+
+    rows_read: u64,
+    rows_written: u64,
+    batches_processed: u64,
+
+    started_at_ms: i64,
+    completed_at_ms: i64,
+};
+```
+
+Aucune ressource ouverte ne doit être retournée dans `PipelineResult`.
+
+---
+
+# 18. Gestion des erreurs
+
+## 18.1 Error set public
+
+```zig
+pub const EngineError = error {
+    SourceOpenFailed,
+    SourceReadFailed,
+    InvalidCsv,
+    InvalidJson,
+    InvalidUtf8,
+    SchemaMismatch,
+    UnknownColumn,
+    UnsupportedType,
+    TypeInferenceFailed,
+    TypeConversionFailed,
+    RuleCompilationFailed,
+    TransformFailed,
+    MatchIndexFailed,
+    MatchScoringFailed,
+    SinkWriteFailed,
+    AuditWriteFailed,
+    SpillFailed,
+    OutOfMemory,
+};
+```
+
+---
+
+## 18.2 Contexte d’erreur
+
+Les erreurs Zig ne transportent pas de contexte dynamique.
+
+```zig
+pub const Stage = enum {
+    source,
+    ingestion,
+    profiling,
+    validation,
+    cleaning,
+    matching,
+    sink,
+    audit,
+};
+```
+
+```zig
+pub const ErrorContext = struct {
+    stage: ?Stage = null,
+    source_id: ?u128 = null,
+    batch_id: ?u64 = null,
+    global_row: ?u64 = null,
+    column_index: ?u32 = null,
+    code: ?ErrorCode = null,
+
+    fn clear(self: *ErrorContext) void
+};
+```
+
+Le composant remplit le contexte avant de retourner l’erreur.
+
+---
+
+## 18.3 Classification
+
+### Erreurs fatales
+
+Exemples :
+
+* source introuvable ;
+* fichier structurellement illisible ;
+* mémoire insuffisante ;
+* sink inaccessible ;
+* journal de provenance impossible à écrire ;
+* schéma incohérent.
+
+Elles arrêtent le pipeline.
+
+### Violations de données
+
+Exemples :
+
+* valeur requise absente ;
+* valeur hors plage ;
+* regex invalide ;
+* doublon ;
+* valeur non autorisée.
+
+Elles sont envoyées au `ViolationSink` et ne deviennent pas des erreurs Zig.
+
+### Valeurs non convertibles
+
+Le comportement dépend de la politique :
+
+```zig
+pub const InvalidValuePolicy = enum {
+    fail_pipeline,
+    set_null,
+    keep_original,
+    emit_violation,
+};
+```
+
+---
+
+# 19. Métriques internes
+
+```zig
+pub const ExecutionMetrics = struct {
+    rows_read: u64 = 0,
+    rows_written: u64 = 0,
+    batches_processed: u64 = 0,
+
+    bytes_read: u64 = 0,
+    bytes_written: u64 = 0,
+
+    source_time_ns: u64 = 0,
+    ingestion_time_ns: u64 = 0,
+    profiling_time_ns: u64 = 0,
+    validation_time_ns: u64 = 0,
+    cleaning_time_ns: u64 = 0,
+    matching_time_ns: u64 = 0,
+    sink_time_ns: u64 = 0,
+
+    peak_batch_memory: usize = 0,
+    spill_bytes: u64 = 0,
+};
+```
+
+Les métriques ne dépendent pas d’un système externe de monitoring.
+
+---
+
+# 20. Stratégie de tests
+
+## 20.1 Organisation
+
+Le dossier `tests/` reflète `src/`.
+
+```text
+tests/
+├── core/
+├── connectors/
+├── ingestion/
+├── profiling/
+├── validation/
+├── cleaning/
+├── matching/
+├── sinks/
+└── pipeline/
+```
+
+---
+
+## 20.2 Core
+
+Tests requis :
+
+* colonne vide ;
+* colonne entièrement nulle ;
+* bitmap traversant plusieurs mots de 64 bits ;
+* accès au premier et dernier élément ;
+* StringColumn vide ;
+* StringColumn avec chaînes vides ;
+* décimaux avec différentes scales ;
+* égalité de schémas ;
+* recherche de colonne ;
+* métadonnées de batch.
+
+---
+
+## 20.3 CSV
+
+Tests requis :
+
+* fichier standard ;
+* séparateur personnalisé ;
+* header présent ;
+* header absent ;
+* champ contenant une virgule ;
+* guillemets échappés ;
+* champ multilignes ;
+* ligne vide ;
+* fichier vide ;
+* header seul ;
+* colonne manquante ;
+* colonne supplémentaire ;
+* guillemet non fermé ;
+* UTF-8 invalide ;
+* batch dépassant 8192 lignes ;
+* fin de fichier au milieu d’un buffer.
+
+---
+
+## 20.4 Ingestion
+
+Tests requis :
+
+* inférence entière ;
+* inférence décimale ;
+* booléens ;
+* dates DMY ;
+* dates ISO ;
+* chaînes avec zéros initiaux ;
+* type ambigu ;
+* colonne mixte ;
+* seuil de confiance ;
+* source non rejouable ;
+* premier batch utilisé pour l’échantillonnage.
+
+---
+
+## 20.5 Profiling
+
+Tests requis :
+
+* min/max ;
+* moyenne ;
+* variance ;
+* null rate ;
+* longueur des chaînes ;
+* cardinalité exacte ;
+* bascule vers HyperLogLog ;
+* résultat HLL dans la marge attendue ;
+* détection de pattern ;
+* accumulation sur plusieurs batches ;
+* colonne entièrement nulle.
+
+---
+
+## 20.6 Validation
+
+Un test valide et un test invalide par type de règle :
+
+* required ;
+* regex ;
+* enum ;
+* range ;
+* type ;
+* longueur ;
+* unique en mémoire ;
+* unique avec spill.
+
+Vérifier également :
+
+* les RowId globaux ;
+* le nombre de violations ;
+* la non-modification du batch ;
+* l’écriture progressive dans le sink ;
+* la génération du résumé.
+
+---
+
+## 20.7 Cleaning
+
+Pour chaque transformation :
+
+* résultat attendu ;
+* batch d’entrée inchangé ;
+* batch de sortie dans l’arena opposé ;
+* schéma correct ;
+* gestion des nulls ;
+* provenance produite ;
+* paramètres sérialisés ;
+* replay identique.
+
+---
+
+## 20.8 Matching
+
+Tests requis :
+
+* exact match ;
+* normalisation ;
+* blocking ;
+* collision de hash ;
+* Levenshtein borné ;
+* arrêt anticipé ;
+* Jaro-Winkler ;
+* seuil de confiance ;
+* résultat entre batches différents ;
+* index avec plusieurs partitions ;
+* écriture progressive dans le MatchSink.
+
+---
+
+## 20.9 Pipeline
+
+Tests de bout en bout :
+
+```text
+CSV
+→ ingestion
+→ profiling
+→ validation
+→ trim
+→ uppercase
+→ CSV sink
+```
+
+Vérifier :
+
+* nombre de lignes lues ;
+* nombre de lignes écrites ;
+* profil final ;
+* violations ;
+* audit ;
+* reset des arenas ;
+* fermeture des fichiers ;
+* comportement en cas d’erreur sink ;
+* absence de sortie partielle validée après échec.
+
+---
+
+# 21. Benchmarks
+
+## 21.1 CSV
+
+Mesures :
+
+* lignes par seconde ;
+* Mo par seconde ;
+* mémoire maximale ;
+* tailles de batch : 1024, 4096, 8192, 16384 ;
+* colonnes courtes et longues ;
+* données avec et sans guillemets.
+
+---
+
+## 21.2 Profiling
+
+Mesures :
+
+* profiling numérique ;
+* profiling texte ;
+* cardinalité faible ;
+* cardinalité élevée ;
+* coût de la bascule HLL ;
+* coût du pattern detection.
+
+---
+
+## 21.3 Cleaning
+
+Mesures :
+
+* trim ;
+* uppercase ASCII ;
+* normalisation Unicode ;
+* replace ;
+* tailles de sortie variables ;
+* coût par million de valeurs.
+
+---
+
+## 21.4 Matching
+
+Mesures :
+
+* exact ;
+* blocking ;
+* Jaro-Winkler ;
+* Levenshtein borné ;
+* nombre moyen de candidats ;
+* index en mémoire ;
+* index partitionné.
+
+---
+
+# 22. Roadmap d’implémentation
+
+Statut mis à jour le 8 août 2026 :
+
+* `[x]` terminé et testé ;
+* `[~]` partiellement implémenté ;
+* `[ ]` non commencé.
+
+## Phase 1 — Core
+
+1. [x] `bitmap.zig`
+2. [x] `decimal.zig` — parsing exact, comparaison, rescale et formatage sans flottant
+3. [x] `string_column.zig`
+4. [x] `value.zig` — sept types physiques, incluant `date` et `datetime`
+5. [x] `schema.zig` — champs, hash, égalité et recherche implémentés
+6. [x] `column.zig` — buffers contigus et null bitmap pour les sept types
+7. [x] `batch_metadata.zig`
+8. [x] `batch.zig` — batch non propriétaire et builder
+9. [x] tests unitaires — limites, overflow décimal, nulls, erreurs de type et reset d'arena
+
+**Résultat attendu :** création manuelle de batches colonnaires fiables.
+
+**État : atteint.** Les batches couvrent `i64`, `f64`, `decimal`, `boolean`,
+`string`, `date` et `datetime`.
+
+---
+
+## Phase 2 — Mémoire et contrats
+
+1. [x] `arena_pool.zig`
+2. [x] double buffering
+3. [x] `reader.zig`
+4. [x] `sink.zig` — cycle `write`/`finish`/`abort` testé
+5. [x] `execution/context.zig`
+6. [x] `error_context.zig` borné
+
+**Résultat attendu :** contrat stable pour les flux et la mémoire.
+
+**État : atteint.** Les durées de vie, le double buffering, le contexte
+d'exécution et le contexte d'erreur borné sont opérationnels.
+
+---
+
+## Phase 3 — CSV
+
+1. [x] parser streaming ;
+2. [x] header ;
+3. [x] guillemets, séparateurs échappés et champs multilignes ;
+4. [x] politiques configurables pour lignes malformées, colonnes et UTF-8 ;
+5. [x] création de batches texte ;
+6. [x] `CsvSource` et contrat `Source` ;
+7. [x] tests avec fixtures.
+
+**Résultat attendu :** lecture d’un vrai CSV par batches colonnaires.
+
+**État : atteint.** Le moteur a traité 2 000 000 lignes et 349 416 788 octets
+en 245 batches avec des limites et politiques d'erreur explicites.
+
+---
+
+## Phase 4 — Ingestion
+
+1. [x] échantillonnage borné sur le premier batch ;
+2. [x] candidats `boolean`, `i64`, `decimal`, `f64`, `date` et `datetime` ;
+3. [x] confiance configurable et repli conservateur vers `string` ;
+4. [x] inférence avec préservation des zéros initiaux ;
+5. [x] conversion vers les sept types du core ;
+6. [x] politiques `fail` et `null_value` pour les valeurs invalides ;
+7. [x] schéma possédé par l'IngestReader et stabilisé après le premier batch.
+
+**Résultat attendu :** CSV brut vers batches typés.
+
+**État : atteint.** Le chemin `infer` utilise une arena brute distincte et
+convertit les sept types, notamment les dates ISO et datetimes UTC.
+
+---
+
+## Phase 5 — Profiling
+
+1. [x] null stats et taux par colonne ;
+2. [x] Welford pour `i64`/`f64` et min/max exacts pour `decimal` ;
+3. [x] longueur minimum, maximum et moyenne ;
+4. [x] cardinalité exacte jusqu'à 10 000 hashes ;
+5. [x] bascule automatique vers HyperLogLog à 16 384 registres ;
+6. [x] détection bornée des emails, dates ISO, URL, UUID et téléphones E.164 ;
+7. [x] ProfileReader incrémental sur les batches typés ;
+8. [x] rapport JSON possédé et sérialisable.
+
+**Résultat attendu :** premier résultat démontrable sur un fichier réel.
+
+**État : atteint.** En ReleaseFast, le rapport du fichier de 2 000 000 lignes
+contient les statistiques numériques, les cardinalités adaptatives et détecte
+les colonnes `email`, `date_iso` et `url` en 245 batches.
+
+Commande future :
+
+```bash
+orusdata profile invoices.csv --output profile.json
+```
+
+---
+
+## Phase 6 — Validation
+
+1. [x] compilation des noms, types et payloads de règles ;
+2. [x] required ;
+3. [x] range typé pour `i64`, `f64` et `decimal` ;
+4. [x] enum texte ;
+5. [x] regex ;
+6. [x] ViolationSink avec échantillonnage borné ;
+7. [x] résumé JSON par règle et par colonne ;
+8. [x] unique en mémoire ;
+9. [x] unique spill.
+
+**Résultat attendu :** validation streaming sans accumulation en RAM.
+
+**État : atteint.** Les regex POSIX ERE sont compilées une fois avant
+l'évaluation. L'unicité exacte commence dans un buffer à limite dure et bascule
+vers un B-tree SQLite temporaire lorsque cette limite est atteinte. Le fichier
+de 2 000 000 lignes a validé une regex email et l'unicité globale en 245 batches,
+avec `unique_rules_spilled=1`, zéro violation et zéro accumulation non bornée.
+
+### Décision différée V-001 — backend de spill exact
+
+**Statut :** dette d'architecture acceptée, non bloquante pour les phases 7 à
+11, bloquante avant la première distribution autonome stable.
+
+L'implémentation actuelle lie SQLite comme bibliothèque système et l'utilise
+uniquement derrière `validation/unique.zig`. Ce choix valide le comportement et
+les performances du POC, mais ne constitue pas encore la décision définitive de
+distribution.
+
+Deux issues restent autorisées :
+
+1. intégrer une version verrouillée de l'amalgamation `sqlite3.c` et la lier
+   statiquement dans les binaires distribués ;
+2. remplacer SQLite par un spill partitionné écrit en Zig, stockant les valeurs
+   canoniques complètes et vérifiant exactement les collisions de hash.
+
+Le simple stockage de hashes `u64` est interdit : une collision ne doit jamais
+produire une violation `duplicate_value`.
+
+Critères de fermeture :
+
+- aucun paquet SQLite requis sur la machine cible ;
+- comportement identique pour chaînes, nombres, dates et décimaux canoniques ;
+- mémoire bornée et fichiers temporaires toujours nettoyés ;
+- zéro faux doublon lors de tests de collisions forcées ;
+- benchmark d'au moins 10 Go avec forte cardinalité ;
+- builds vérifiés pour Linux musl et macOS, plus Windows si cette cible entre
+  dans le périmètre de la première version stable ;
+- décision et justification consignées dans `CODE_RULES.md`.
+
+SQLite, ses types, ses erreurs et ses options ne doivent pas sortir du module
+`validation/unique.zig` pendant cette période, afin que le backend reste
+remplaçable sans modifier `RuleEngine`, les règles JSON ou les violations.
+
+---
+
+## Phase 7 — Cleaning
+
+1. [x] contrat Transform immuable ;
+2. [x] trim ;
+3. [x] uppercase ASCII ;
+4. [x] lowercase ASCII ;
+5. [x] replace exact ;
+6. [x] provenance par batch ;
+7. [x] AuditLog JSONL append-only ;
+8. [x] CSV Sink streaming ;
+9. [x] normalisation des dates ISO et datetimes UTC ;
+10. [x] normalisation exacte des décimaux.
+
+**Résultat attendu :** production d’un nouveau dataset nettoyé et auditable.
+
+**État : atteint pour le périmètre ASCII/ISO du POC.** Le parcours `clean`
+utilise des arenas d'entrée et sortie distinctes, réinitialise le scratch à
+chaque batch, écrit un CSV relisible et une provenance JSONL bornée par batch.
+
+---
+
+## Phase 8 — Pipeline
+
+1. [x] builder ;
+2. [x] compilation du plan ;
+3. [x] chaînage des readers ;
+4. [x] transforms ;
+5. [x] sinks ;
+6. [x] gestion des erreurs ;
+7. [x] métriques — lignes, batches et octets lus
+8. [x] résultat final.
+
+**Résultat attendu :** pipeline complet de bout en bout.
+
+**État : atteint.** Le builder produit un plan possédé par le contexte, chaîne
+ingestion, profiling et validation avec des adresses stables, applique plusieurs
+transforms en alternant deux arenas, puis finalise ou abandonne le sink. Le
+résultat ne contient aucune ressource ouverte. Un benchmark ReleaseFast sur
+2 000 000 lignes, une transformation et un `NullSink` traite 245 batches et
+349 416 788 octets en 3,332 secondes, soit environ 600 000 lignes/s.
+
+### Exigence différée P-001 — sorties fichier atomiques
+
+**Statut :** non bloquante pour les phases suivantes, bloquante avant une
+garantie de production sur les sinks fichier.
+
+`Pipeline` appelle déjà `Sink.abort` lors d'un échec. `CsvSink` doit encore
+écrire dans un fichier temporaire situé sur le même volume, fermer et synchroniser
+ce fichier après succès, puis le renommer atomiquement vers la destination. En
+cas d'abort, le fichier temporaire doit être supprimé et une destination
+préexistante doit rester intacte.
+
+Critères de fermeture : écriture réussie, erreur au milieu d'un batch, erreur de
+flush, destination préexistante, nettoyage du temporaire et renommage atomique
+doivent tous être couverts par des tests.
+
+---
+
+## Phase 9 — Matching exact
+
+1. [x] normalisation ;
+2. [x] clés exactes ;
+3. [x] blocking ;
+4. [x] index mémoire ;
+5. [x] MatchSink ;
+6. [x] matching entre datasets complets.
+
+**Résultat attendu :** rapprochement exact et déduplication simple.
+
+**État : atteint avec index mémoire borné.** La normalisation ASCII versionnée
+gère trim, casse, espaces et ponctuation configurables. Les stratégies de
+blocking exact, préfixe et préfixe de premier token produisent des clés
+empruntées. L'index conserve les valeurs normalisées complètes et vérifie les
+octets après le hash. Son allocateur impose une limite dure et retourne
+`MatchIndexMemoryLimit` au lieu de croître sans borne. Les résultats sont écrits
+au `MatchSink` par blocs de 256.
+
+Un benchmark ReleaseFast indexe 2 000 000 de clients, relit 2 000 000 de
+candidats et produit 2 000 000 de matches en 6,567 secondes. Le pic mémoire de
+l'index est 543 MiB sous une limite configurée de 768 MiB. Une limite de 512 MiB
+échoue explicitement sur cette cardinalité. Le spill/partitionnement de l'index
+reste un critère de la phase 10.
+
+---
+
+## Phase 10 — Matching fuzzy
+
+1. [x] Jaro-Winkler ;
+2. [x] Levenshtein borné ;
+3. [x] scoring composite ;
+4. [x] seuils ;
+5. [x] index partitionné ;
+6. [x] spill sur disque ;
+7. [x] benchmarks.
+
+**Résultat attendu :** rapprochement approximatif exploitable en production.
+
+**État : atteint dans le périmètre de la phase.** Le moteur combine une
+distance de Levenshtein bornée et Jaro-Winkler avec poids et seuil configurables.
+Le blocking exact, par préfixe ou préfixe de token limite les candidats. Le
+backend partitionné écrit des enregistrements binaires temporaires, charge une
+partition de référence à la fois sous une limite mémoire stricte, écrit les
+résultats progressivement et supprime les fichiers après succès ou échec.
+
+Sur `customers-2000000.csv`, le benchmark ReleaseFast parcourt deux fois les
+2 000 000 lignes, trouve 2 000 000 de correspondances et atteint 603 247
+lignes/s. Avec 32 partitions et une limite de 32 MiB, le pic mesuré de l'index
+est de 13 MiB et le spill représente 209 MiB. Les limites de candidats et de
+résultats par ligne restent explicites afin d'empêcher une explosion
+combinatoire sur des clés de blocking trop larges.
+
+---
+
+## Phase 11 — Connecteurs supplémentaires
+
+1. [x] JSON Lines ;
+2. [x] PostgreSQL ;
+3. [x] nouveaux sinks ;
+4. [x] formats binaires éventuels évalués et reportés.
+
+**Résultat atteint.** Le connecteur JSON Lines lit des objets plats en
+streaming, infère un schéma typé sur le premier objet et impose des limites de
+batch et de taille d'enregistrement. Le connecteur PostgreSQL utilise le mode
+single-row de `libpq` et regroupe les lignes en batches sans matérialiser la
+requête complète. Il est optionnel (`-Dpostgres=true`) afin de ne pas ajouter
+de dépendance runtime aux binaires qui ne l'utilisent pas. `JsonlSink` écrit
+progressivement et `MemorySink` conserve des petits résultats sous des limites
+explicites de lignes et d'octets.
+
+Le benchmark JSONL convertit puis relit les 2 000 000 clients : 432 255
+lignes/s en écriture et 504 954 lignes/s en lecture pour 644 085 001 octets.
+Le test PostgreSQL réel lit 20 000 lignes en 20 batches. Arrow et Parquet sont
+reportés jusqu'à la définition d'un contrat de format et d'une politique de
+dépendance ; ils ne sont pas requis par les critères v1.0.
+
+---
+
+# 23. Critères de validation de la v1.0
+
+La v1.0 est considérée comme fonctionnelle lorsque le moteur peut :
+
+1. lire un CSV en streaming ;
+2. produire des batches colonnaires ;
+3. inférer un schéma ;
+4. préserver les zéros initiaux en cas d’ambiguïté ;
+5. profiler toutes les colonnes ;
+6. calculer une cardinalité adaptative ;
+7. appliquer des règles de validation ;
+8. écrire les violations progressivement ;
+9. appliquer des transformations sans modifier les batches sources ;
+10. produire un dataset nettoyé ;
+11. enregistrer une provenance rejouable ;
+12. utiliser un double buffer d’arenas ;
+13. maintenir une consommation mémoire bornée ;
+14. produire des métriques d’exécution ;
+15. effectuer un matching exact entre deux datasets ;
+16. passer tous les tests unitaires et d’intégration ;
+17. traiter un fichier significativement plus grand que la mémoire disponible sans charger le dataset complet.
+
+---
+
+# 24. Principes préparant les futures couches
+
+## Audit de readiness v1.0
+
+L'audit du 2026-08-08 conclut, apres fermeture du replay, que le socle satisfait
+15 criteres sur 17 et que deux criteres restent partiels. La release v1.0 reste
+bloquee par les sorties fichier atomiques et l'identite versionnee des sources.
+Le rapport normatif est `docs/V1_AUDIT_REPORT.md`.
+
+Ordre de fermeture :
+
+1. [x] provenance rejouable et registre de transforms ;
+2. [ ] sorties atomiques CSV, JSONL, audit et violations ;
+3. [ ] identite et hash de contenu des sources ;
+4. [ ] CLI unifiee couvrant pipeline, matching et connecteurs ;
+5. [ ] decision de distribution V-001 ;
+6. [ ] endurance 10 Go et gates Linux/macOS ;
+7. [ ] fuzzing et injection de fautes.
+
+---
+
+Bien que l’Ontology, les workflows et l’IA ne fassent pas partie du moteur, Orus Data Engine doit préparer leur intégration.
+
+## Pour l’Ontology
+
+Le moteur fournit :
+
+* des schémas stables ;
+* des types précis ;
+* des identités de source ;
+* des RowId globaux ;
+* des données nettoyées ;
+* des correspondances entre entités ;
+* une provenance.
+
+## Pour les workflows
+
+Le moteur fournit :
+
+* des violations ;
+* des résultats de matching ;
+* des événements de pipeline ;
+* des résumés ;
+* des sorties structurées ;
+* des erreurs contextualisées.
+
+## Pour l’IA
+
+Le moteur fournit :
+
+* des données fiables ;
+* des transformations explicables ;
+* des types cohérents ;
+* des profils de qualité ;
+* des correspondances scorées ;
+* des sources identifiables ;
+* une traçabilité complète.
+
+---
+
+# 25. Résumé de l’architecture
+
+```text
+Sources
+├── CSV
+├── JSON Lines
+└── PostgreSQL
+
+        ↓
+
+Ingestion
+├── lecture streaming
+├── échantillonnage
+├── inférence
+└── conversion typée
+
+        ↓
+
+Batches colonnaires immuables
+├── buffers typés
+├── StringColumn
+├── NullBitmap
+└── BatchMetadata
+
+        ↓
+
+Taps
+├── Profiling
+└── Validation
+
+        ↓
+
+Transforms
+├── string operations
+├── normalisation
+└── provenance
+
+        ↓
+
+Matching
+├── normalisation
+├── blocking
+├── index
+└── scoring
+
+        ↓
+
+Sinks
+├── CSV
+├── JSON Lines
+├── violations
+├── matches
+└── audit
+
+        ↓
+
+Couches futures
+├── Ontology
+├── Workflows
+├── Analytics
+└── IA
+```
+
+---
+
+# 26. Vision technique
+
+Orus Data Engine ne doit pas être conçu comme un simple parseur CSV ou un outil de nettoyage ponctuel.
+
+Il doit devenir un moteur fondamental capable de garantir que toute donnée entrant dans l’écosystème Orus est :
+
+* structurée ;
+* typée ;
+* analysée ;
+* validée ;
+* nettoyée ;
+* rapprochée ;
+* traçable ;
+* reproductible ;
+* exploitable par des systèmes de décision.
+
+Le moteur constitue la couche de confiance sur laquelle seront construites l’Ontology, les workflows opérationnels et l’intelligence artificielle d’Orus.
