@@ -2,6 +2,11 @@
 .zig-cache/
 zig-out/
 
+# Python cache & bytecode
+__pycache__/
+*.pyc
+*.pyo
+
 # Operating System files
 .DS_Store
 .DS_Store?
