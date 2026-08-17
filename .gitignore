@@ -6,6 +6,18 @@ zig-out/
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+*.egg-info/
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+
+# Local Orus Control Plane state
+.orus-control/
 
 # Operating System files
 .DS_Store

@@ -1,6 +1,7 @@
 const std = @import("std");
 const batch = @import("../core/batch.zig");
 const sink_mod = @import("../core/sink.zig");
+const csv_sink = @import("csv_sink.zig");
 
 pub const JsonlSink = struct {
     allocator: std.mem.Allocator,
@@ -44,15 +45,8 @@ pub const JsonlSink = struct {
     pub fn write(self: *JsonlSink, input: *const batch.Batch) !void {
         if (self.finished or self.aborted) return error.SinkClosed;
         for (0..input.row_count) |row| {
-            try self.writer.interface.writeByte('{');
-            for (input.schema.fields, 0..) |field, index| {
-                if (index != 0) try self.writer.interface.writeByte(',');
-                try writeJsonString(&self.writer.interface, field.name);
-                try self.writer.interface.writeByte(':');
-                const column = input.column(index);
-                if (column.isNull(row)) try self.writer.interface.writeAll("null") else try writeValue(&self.writer.interface, column, row);
-            }
-            try self.writer.interface.writeAll("}\n");
+            try writeRowObject(&self.writer.interface, input, row);
+            try self.writer.interface.writeByte('\n');
             self.rows_written += 1;
         }
     }
@@ -84,6 +78,19 @@ pub const JsonlSink = struct {
     }
 };
 
+pub fn writeRowObject(writer: *std.Io.Writer, input: *const batch.Batch, row: usize) !void {
+    if (row >= input.row_count) return error.RowOutOfBounds;
+    try writer.writeByte('{');
+    for (input.schema.fields, 0..) |field, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeJsonString(writer, field.name);
+        try writer.writeByte(':');
+        const column = input.column(index);
+        if (column.isNull(row)) try writer.writeAll("null") else try writeValue(writer, column, row);
+    }
+    try writer.writeByte('}');
+}
+
 fn writeValue(writer: *std.Io.Writer, column: *const @import("../core/column.zig").Column, row: usize) !void {
     var decimal_buffer: [80]u8 = undefined;
     switch (column.data) {
@@ -95,8 +102,20 @@ fn writeValue(writer: *std.Io.Writer, column: *const @import("../core/column.zig
         .decimal => |items| try writeJsonString(writer, try items[row].formatInto(&decimal_buffer)),
         .boolean => |items| try writer.writeAll(if (items.isSet(row)) "true" else "false"),
         .string => |items| try writeJsonString(writer, items.get(row)),
-        .date => |items| try writer.print("{d}", .{items[row]}),
-        .datetime => |items| try writer.print("{d}", .{items[row]}),
+        .date => |items| try writeJsonString(writer, try csv_sink.formatDate(items[row], &decimal_buffer)),
+        .datetime => |items| {
+            const days: i32 = @intCast(@divFloor(items[row], 86_400));
+            const seconds = @mod(items[row], 86_400);
+            const date = try csv_sink.formatDate(days, &decimal_buffer);
+            var datetime_buffer: [32]u8 = undefined;
+            const formatted = try std.fmt.bufPrint(&datetime_buffer, "{s}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+                date,
+                @divFloor(seconds, 3600),
+                @divFloor(@mod(seconds, 3600), 60),
+                @mod(seconds, 60),
+            });
+            try writeJsonString(writer, formatted);
+        },
     }
 }
 

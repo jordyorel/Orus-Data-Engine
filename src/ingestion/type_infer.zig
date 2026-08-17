@@ -136,11 +136,10 @@ pub fn parseDecimal(text: []const u8) ?decimal.Decimal128 {
 }
 
 fn parseDecimalCandidate(text: []const u8) bool {
-    return std.mem.indexOfScalar(u8, text, '.') != null and parseDecimal(text) != null;
+    return parseDecimal(text) != null;
 }
 
 pub fn parseF64(text: []const u8) ?f64 {
-    if (std.mem.indexOfAny(u8, text, "eE") == null) return null;
     const parsed = std.fmt.parseFloat(f64, text) catch return null;
     return if (std.math.isFinite(parsed)) parsed else null;
 }
@@ -171,14 +170,24 @@ fn record(counts: *CandidateCounts, index: usize, success: bool) void {
 fn selectType(candidates: [6]TypeCandidate, leading_zeroes: bool, options: Options) value.ValueTag {
     if (leading_zeroes) return .string;
     var qualifying: usize = 0;
+    var numeric_qualifying: usize = 0;
     for (candidates) |candidate| {
-        if (candidate.score >= options.minimum_confidence) qualifying += 1;
+        if (candidate.score >= options.minimum_confidence) {
+            qualifying += 1;
+            if (isNumeric(candidate.tag)) numeric_qualifying += 1;
+        }
     }
-    if (qualifying > 1 and options.prefer_string_on_ambiguity) return .string;
+    if (qualifying > 1 and numeric_qualifying != qualifying and options.prefer_string_on_ambiguity) {
+        return .string;
+    }
     for (candidates) |candidate| {
         if (candidate.score >= options.minimum_confidence) return candidate.tag;
     }
     return .string;
+}
+
+fn isNumeric(tag: value.ValueTag) bool {
+    return tag == .i64 or tag == .decimal or tag == .f64;
 }
 
 fn candidateScore(candidates: [6]TypeCandidate, tag: value.ValueTag) f32 {
@@ -235,6 +244,27 @@ test "inference selects boolean integer decimal and scientific float" {
     try std.testing.expectEqual(@as(i128, 125), parseDecimal("1.25").?.coefficient);
     try std.testing.expectEqual(@as(i128, -74), parseDecimal("-74").?.coefficient);
     try std.testing.expectEqual(@as(?f64, 1000), parseF64("1e3"));
+}
+
+test "inference promotes mixed fixed point values and ignores nulls" {
+    const arena_pool = @import("../core/arena_pool.zig");
+    var arena = arena_pool.BatchArena.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = [_]schema.Field{.{ .name = "age" }};
+    const source_schema = schema.Schema{ .fields = &fields, .hash = schema.Schema.computeHash(&fields) };
+    var builder = try batch.Builder.init(&arena, &source_schema);
+    try builder.appendString(0, "22");
+    try builder.finishRow();
+    try builder.appendNull(0);
+    try builder.finishRow();
+    try builder.appendString(0, "0.83");
+    try builder.finishRow();
+    const input = try builder.finish(.{});
+
+    const result = try inferColumn(input.column(0), .{});
+    try std.testing.expectEqual(value.ValueTag.decimal, result.selected);
+    try std.testing.expect(result.nullable);
+    try std.testing.expectEqual(@as(f32, 1), result.confidence);
 }
 
 test "inference preserves rare alphanumeric identifiers by default" {

@@ -116,7 +116,7 @@ fn writeValue(writer: *std.Io.Writer, column: *const @import("../core/column.zig
     }
 }
 
-fn formatDate(days_since_epoch: i32, buffer: []u8) ![]const u8 {
+pub fn formatDate(days_since_epoch: i32, buffer: []u8) ![]const u8 {
     const days: i64 = @as(i64, days_since_epoch) + 719468;
     const era = @divFloor(days, 146097);
     const day_of_era = days - era * 146097;

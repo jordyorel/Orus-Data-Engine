@@ -24,11 +24,97 @@ pub fn main(init: std.process.Init) !void {
         const batch_size = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 1024;
         return runValidate(init, path, rules_path, batch_size);
     }
+    if (std.mem.eql(u8, command, "export-jsonl")) {
+        const source_id = args.next() orelse return usage();
+        const run_id = args.next() orelse return usage();
+        const observed_at = args.next() orelse return usage();
+        const batch_size = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 1024;
+        const start_offset = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else 0;
+        const max_rows = if (args.next()) |raw| try std.fmt.parseInt(u64, raw, 10) else null;
+        return runExportJsonl(
+            init,
+            path,
+            source_id,
+            run_id,
+            observed_at,
+            batch_size,
+            start_offset,
+            max_rows,
+        );
+    }
     const batch_size = if (args.next()) |raw| try std.fmt.parseInt(usize, raw, 10) else 1024;
     if (std.mem.eql(u8, command, "benchmark")) return runBenchmark(init, path, batch_size);
     if (std.mem.eql(u8, command, "profile")) return runProfile(init, path, batch_size);
     if (std.mem.eql(u8, command, "infer")) return runInfer(init, path, batch_size);
     return usage();
+}
+
+fn runExportJsonl(
+    init: std.process.Init,
+    path: []const u8,
+    source_id: []const u8,
+    run_id: []const u8,
+    observed_at: []const u8,
+    batch_size: usize,
+    start_offset: u64,
+    max_rows: ?u64,
+) !void {
+    var allocators = engine.execution.allocators.PipelineAllocators.init(init.gpa);
+    defer allocators.deinit();
+    var csv_source = try engine.connectors.csv_source.CsvSource.init(
+        init.io,
+        allocators.run(),
+        path,
+        .{ .batch_size = batch_size },
+    );
+    defer csv_source.deinit();
+    var ingest = engine.ingestion.ingest_reader.IngestReader.init(
+        allocators.run(),
+        csv_source.asSource(),
+        .{},
+    );
+    defer ingest.deinit();
+
+    var output_buffer: [64 * 1024]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
+    var batch_id: u64 = 0;
+    var global_offset: u64 = 0;
+    var rows_emitted: u64 = 0;
+    while (try ingest.next(allocators.batches.input())) |typed| {
+        for (0..typed.row_count) |row| {
+            if (global_offset < start_offset) {
+                global_offset += 1;
+                continue;
+            }
+            if (max_rows != null and rows_emitted >= max_rows.?) {
+                try output.interface.flush();
+                return;
+            }
+            try output.interface.print(
+                "{{\"contract_version\":1,\"record\":",
+                .{},
+            );
+            try engine.sinks.jsonl_sink.writeRowObject(&output.interface, &typed, row);
+            try output.interface.print(
+                ",\"source\":{{\"source_id\":{f},\"batch_id\":{d},\"row_id\":{d}," ++
+                    "\"global_offset\":{d},\"observed_at\":{f}}},\"run_id\":{f}}}\n",
+                .{
+                    std.json.fmt(source_id, .{}),
+                    batch_id,
+                    row,
+                    global_offset,
+                    std.json.fmt(observed_at, .{}),
+                    std.json.fmt(run_id, .{}),
+                },
+            );
+            global_offset += 1;
+            rows_emitted += 1;
+        }
+        batch_id += 1;
+        try output.interface.flush();
+        allocators.batches.input().reset();
+    }
+    try output.interface.flush();
 }
 
 fn runReplay(
@@ -392,6 +478,8 @@ fn usage() !void {
         "usage:\n  orusdata <profile|infer> <file.csv> [batch_size]\n" ++
             "  orusdata benchmark <file.csv> [batch_size]\n" ++
             "  orusdata validate <file.csv> <rules.json> [batch_size]\n" ++
+            "  orusdata export-jsonl <file.csv> <source_id> <run_id> <observed_at> " ++
+            "[batch_size] [start_offset] [max_rows]\n" ++
             "  orusdata clean <file.csv> <output.csv> <column> <trim|uppercase|lowercase> [batch_size]\n" ++
             "  orusdata replay <file.csv> <audit.jsonl> <output.csv> [batch_size]\n",
         .{},
